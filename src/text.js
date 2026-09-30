@@ -64,4 +64,27 @@ function transformRange(range, edits) {
   return { start, end, affected };
 }
 
-module.exports = { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange };
+// 续提换算：把基版坐标下的半开选区映射过一组同段互不重叠的修订（同一版本步内）。
+// 与 transformRange 的差异：比较始终在原坐标系进行、位移累积计算（相邻修订互不干扰）；
+// 零长度选区（插入点）被任何修订区间触及（start <= k <= end）即视为受影响——
+// 此时插入点相对新旧文字的位置无法可靠推断，调用方必须拒绝自动换算，
+// 不得凭同文搜索猜测位置。
+function transformRangeRebase(range, edits) {
+  const { start, end } = range;
+  const point = start === end;
+  let delta = 0;
+  for (const e of edits.slice().sort((a, b) => a.start - b.start)) {
+    const d = codeLength(e.replace) - (e.end - e.start);
+    if (point) {
+      if (e.start <= start && start <= e.end) return { start, end, affected: true };
+      if (e.end < start) delta += d;
+    } else if (e.end <= start) {
+      delta += d;
+    } else if (e.start < end) {
+      return { start, end, affected: true };
+    }
+  }
+  return { start: start + delta, end: end + delta, affected: false };
+}
+
+module.exports = { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange, transformRangeRebase };

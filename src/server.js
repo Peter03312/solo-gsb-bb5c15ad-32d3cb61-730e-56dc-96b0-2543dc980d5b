@@ -78,6 +78,16 @@ app.post('/api/proposals/:id/reject', requireRole('reviewer'), wrap((req, res) =
   res.json({ ok: true });
 }));
 
+// ---------- 续提（记录员；仅限本人的“基版已过期”冲突提议，归属校验在 store 内） ----------
+app.post('/api/proposals/:id/rebase-preview', requireRole('recordist'), wrap((req, res) => {
+  res.json(store.rebasePreview(db, req.user, parseInt(req.params.id, 10)));
+}));
+
+app.post('/api/proposals/:id/rebase-confirm', requireRole('recordist'), wrap((req, res) => {
+  const id = store.confirmRebase(db, req.user, parseInt(req.params.id, 10), req.body || {});
+  res.status(201).json({ ok: true, id });
+}));
+
 // ---------- 发布（复核员） ----------
 app.post('/api/publish', requireRole('reviewer'), wrap((req, res) => {
   const { note } = req.body || {};

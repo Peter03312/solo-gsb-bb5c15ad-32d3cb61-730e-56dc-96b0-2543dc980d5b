@@ -76,6 +76,8 @@ function initSchema(db) {
     base_version_id INTEGER NOT NULL REFERENCES versions(id),
     status      TEXT NOT NULL CHECK (status IN ('pending','adopted','rejected','conflicted','published')),
     conflict_reason TEXT NOT NULL DEFAULT '',
+    conflict_kind TEXT NOT NULL DEFAULT '',  -- 冲突类别：base_expired（基版已过期）| overlap（范围交叠）
+    rebased_from_id INTEGER REFERENCES proposals(id), -- 续提来源：本提议由哪个冲突提议换算重提而来
     created_by  INTEGER NOT NULL REFERENCES users(id),
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     decided_by  INTEGER REFERENCES users(id),
@@ -133,6 +135,17 @@ function initSchema(db) {
   CREATE INDEX IF NOT EXISTS idx_decisions_version ON decisions(version_id);
   CREATE INDEX IF NOT EXISTS idx_anchors_version ON objection_anchors(version_id);
   `);
+
+  // 既有数据库的轻量迁移：补充续提所需列，并按冲突原因文本回填类别
+  const pcols = db.prepare('PRAGMA table_info(proposals)').all().map((c) => c.name);
+  if (!pcols.includes('conflict_kind')) {
+    db.exec(`ALTER TABLE proposals ADD COLUMN conflict_kind TEXT NOT NULL DEFAULT ''`);
+    db.exec(`UPDATE proposals SET conflict_kind='base_expired' WHERE status='conflicted' AND conflict_reason LIKE '基版已过期%'`);
+    db.exec(`UPDATE proposals SET conflict_kind='overlap' WHERE status='conflicted' AND conflict_kind='' AND conflict_reason<>''`);
+  }
+  if (!pcols.includes('rebased_from_id')) {
+    db.exec(`ALTER TABLE proposals ADD COLUMN rebased_from_id INTEGER REFERENCES proposals(id)`);
+  }
 }
 
 function seed(db) {

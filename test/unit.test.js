@@ -1,7 +1,7 @@
 'use strict';
-// 纯文本算子单元测试（码点偏移、合版、引用映射）
+// 纯文本算子单元测试（码点偏移、合版、引用映射、续提换算）
 const assert = require('assert');
-const { codeLength, sliceCP, validateRange, applyEdits, transformRange } = require('../src/text');
+const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase } = require('../src/text');
 const { parseTranscript } = require('../src/store');
 
 let n = 0;
@@ -37,6 +37,40 @@ ok(t.affected === true, '引用与修订相交：标记需重新定位');
 // 修订在引用之后 → 坐标不变
 t = transformRange({ start: 0, end: 2 }, [{ start: 3, end: 4, replace: 'QQQQ' }]);
 ok(t.start === 0 && t.end === 2 && t.affected === false, '引用在修订之前：坐标不变');
+
+// ---------- 续提换算（transformRangeRebase） ----------
+// 非零选区：前方相邻修订长度有增有减，位移应累积计算
+let rb = transformRangeRebase({ start: 5, end: 7 }, [
+  { start: 0, end: 4, replace: 'X' },   // Δ = -3
+  { start: 4, end: 5, replace: 'YY' },  // Δ = +1
+]);
+ok(rb.start === 3 && rb.end === 5 && rb.affected === false, '续提换算：相邻修订累积平移 [5,7)→[3,5)');
+
+// 修订与选区相交 → 受影响，拒绝换算
+rb = transformRangeRebase({ start: 2, end: 5 }, [{ start: 4, end: 6, replace: 'Q' }]);
+ok(rb.affected === true, '续提换算：修订与选区相交即受影响');
+
+// 边界相接不算触及（半开区间，可无缝相接）
+rb = transformRangeRebase({ start: 2, end: 5 }, [{ start: 0, end: 2, replace: 'XYZ' }]);
+ok(rb.start === 3 && rb.end === 6 && rb.affected === false, '续提换算：修订终点与选区起点相接不算触及');
+
+// 零长度插入点：严格在前方的修订 → 平移
+rb = transformRangeRebase({ start: 4, end: 4 }, [{ start: 0, end: 2, replace: 'XYZW' }]);
+ok(rb.start === 6 && rb.end === 6 && rb.affected === false, '插入点：前方修订使其平移 +2');
+
+// 插入点被修订区间覆盖 → 受影响
+rb = transformRangeRebase({ start: 4, end: 4 }, [{ start: 3, end: 6, replace: 'Q' }]);
+ok(rb.affected === true, '插入点被修订区间覆盖：受影响');
+
+// 插入点恰在修订起点 / 终点 → 均视为触及
+rb = transformRangeRebase({ start: 4, end: 4 }, [{ start: 4, end: 6, replace: 'Q' }]);
+ok(rb.affected === true, '插入点恰在修订起点：触及');
+rb = transformRangeRebase({ start: 4, end: 4 }, [{ start: 2, end: 4, replace: 'Q' }]);
+ok(rb.affected === true, '插入点恰在修订终点：触及');
+
+// 插入点之后的修订 → 不变
+rb = transformRangeRebase({ start: 4, end: 4 }, [{ start: 5, end: 8, replace: 'Q' }]);
+ok(rb.start === 4 && rb.end === 4 && rb.affected === false, '插入点之后的修订不影响');
 
 // 解析：段号与自动编号
 const segs = parseTranscript('1. 第一段\n2、第二段\n无段号正文\n4 第四段\n');

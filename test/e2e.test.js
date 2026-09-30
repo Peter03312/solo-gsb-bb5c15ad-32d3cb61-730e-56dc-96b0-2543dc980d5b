@@ -243,6 +243,169 @@ async function main() {
   const oAfter = booth.objections.find((x) => x.id === oid);
   ok(oAfter.anchor_status === 'active', '不相交修订发布后，已重定位异议保持 active（不回退）');
 
+  console.log('\n[续提：权限与前置校验]');
+  // 当前 v4；p4（第4段 王五→王武，基版 v1）已因发布被标“基版已过期”
+  const pid4 = p4.json.id;
+  await expectFail(req('POST', `/api/proposals/${pid4}/rebase-preview`, {}, rev), 403, '无权操作', '复核员尝试续提预览');
+  await expectFail(req('POST', `/api/proposals/${pid4}/rebase-preview`, {}, par), 403, '无权操作', '参与者尝试续提预览');
+  await expectFail(req('POST', `/api/proposals/${p2.json.id}/rebase-preview`, {}, rec), 409, '基版已过期', '交叠类冲突提议续提');
+  await expectFail(req('POST', `/api/proposals/${id1}/rebase-preview`, {}, rec), 409, '冲突', '已发布提议续提');
+  await expectFail(req('POST', '/api/proposals/9999/rebase-preview', {}, rec), 404, '不存在', '续提不存在的提议');
+
+  // 第二名记录员（非本人）——直接落库建号后登录
+  const { hashPassword, DB_PATH } = require('../src/db');
+  const Database = require('better-sqlite3');
+  const raw = new Database(DB_PATH);
+  raw.prepare(`INSERT INTO users (username, display_name, role, password_hash) VALUES (?,?,?,?)`)
+    .run('recorder2', '记录员乙', 'recordist', hashPassword('recorder234'));
+  raw.close();
+  const rec2 = await login('recorder2', 'recorder234');
+  await expectFail(req('POST', `/api/proposals/${pid4}/rebase-preview`, {}, rec2), 403, '本人', '非本人提议拒绝续提');
+
+  console.log('\n[续提：预览换算与确认生成]');
+  const pv1 = await req('POST', `/api/proposals/${pid4}/rebase-preview`, {}, rec);
+  assert.strictEqual(pv1.status, 200);
+  ok(pv1.json.fromVersion === 1 && pv1.json.toVersion === 4,
+    `预览：v${pv1.json.fromVersion} → v${pv1.json.toVersion} 逐版换算`);
+  ok(pv1.json.seg === 4 && pv1.json.excerpt === '王五', '目标选区摘录与原文一致（本段无中途修订，偏移不变）');
+  ok(pv1.json.replacement === '王武' && pv1.json.basis === '笔误', '预览带回原替换文字与依据');
+  ok(pv1.json.stageOverlap === null && pv1.json.token && pv1.json.token.v === 4, '暂存区无交叠，返回预览凭证');
+
+  await expectFail(req('POST', `/api/proposals/${pid4}/rebase-confirm`, {}, rec), 400, '预览凭证', '缺少预览凭证拒绝确认');
+
+  const cf1 = await req('POST', `/api/proposals/${pid4}/rebase-confirm`, { token: pv1.json.token }, rec);
+  assert.strictEqual(cf1.status, 201);
+  const nid1 = cf1.json.id;
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const N1 = booth.proposals.find((x) => x.id === nid1);
+  ok(N1 && N1.status === 'pending' && N1.base_ver === 4, `续提生成新待复核提议 #${nid1}（基版 v4）`);
+  ok(N1.rebased_from_id === pid4 && N1.original_excerpt === '王五' && N1.replacement === '王武',
+    '新提议关联原提议并沿用替换文字与依据');
+  const P4after = booth.proposals.find((x) => x.id === pid4);
+  ok(P4after.status === 'conflicted' && P4after.continued_by_id === nid1,
+    '原冲突提议保持可追溯（状态不变，标注已续提）');
+
+  // 新提议沿用现有复核与发布规则
+  const adN1 = await req('POST', `/api/proposals/${nid1}/adopt`, {}, rev);
+  ok(adN1.status === 200 && !adN1.json.markedConflict, '续提提议可被复核员正常采纳');
+  const pub5 = await req('POST', '/api/publish', { note: '续提发布' }, rev);
+  ok(pub5.status === 201 && pub5.json.versionId === 5, '续提提议随 v5 发布');
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(booth.segments.find((s) => s.seg === 4).text.includes('王武'), 'v5 正文已应用续提修订');
+
+  console.log('\n[续提：中途修订触及选区 → 拒绝]');
+  let seg1now = booth.segments.find((s) => s.seg === 1).text; // 含“现在宣布开庭”
+  const iOpen2 = cpIndexOf(seg1now, '现在宣布开庭');
+  const p7 = await req('POST', '/api/proposals',
+    { seg: 1, start: iOpen2, end: iOpen2 + 6, replacement: '现在正式开庭', basis: '庭长口径' }, rec);
+  assert.strictEqual(p7.status, 201);
+  // 另一提议覆盖同一范围并被采纳发布 → p7 基版过期且选区被中途修订触及
+  const p8 = await req('POST', '/api/proposals',
+    { seg: 1, start: iOpen2, end: iOpen2 + 6, replacement: '现在继续开庭', basis: '录音核对' }, rec);
+  assert.strictEqual(p8.status, 201);
+  await req('POST', `/api/proposals/${p8.json.id}/adopt`, {}, rev);
+  await req('POST', '/api/publish', { note: '触及选区' }, rev);
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(booth.currentVersion.id === 6, '发布 v6');
+  ok(booth.proposals.find((x) => x.id === p7.json.id).status === 'conflicted', 'p7 因发布被标基版已过期');
+  await expectFail(req('POST', `/api/proposals/${p7.json.id}/rebase-preview`, {}, rec), 409, '触及', '中途修订触及选区，预览即拒绝');
+
+  console.log('\n[续提：零长度选区的插入点]');
+  seg1now = booth.segments.find((s) => s.seg === 1).text; // 含“现在继续开庭”
+  const iCont = cpIndexOf(seg1now, '现在继续开庭');
+  // 插入点紧贴“现在继续开庭”之后
+  const p9 = await req('POST', '/api/proposals',
+    { seg: 1, start: iCont + 6, end: iCont + 6, replacement: '，全体起立', basis: '程序记录' }, rec);
+  assert.strictEqual(p9.status, 201);
+  // 修订替换“现在继续开庭”（其终点恰为插入点）→ 触及插入点
+  const p10 = await req('POST', '/api/proposals',
+    { seg: 1, start: iCont, end: iCont + 6, replacement: '庭审继续进行', basis: '录音核对' }, rec);
+  assert.strictEqual(p10.status, 201);
+  await req('POST', `/api/proposals/${p10.json.id}/adopt`, {}, rev);
+  await req('POST', '/api/publish', { note: '触及插入点' }, rev);
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(booth.currentVersion.id === 7, '发布 v7');
+  await expectFail(req('POST', `/api/proposals/${p9.json.id}/rebase-preview`, {}, rec), 409, '插入点', '修订终点触及插入点，拒绝换算');
+
+  // 未被触及的零长度选区：可预览、可确认
+  const p11 = await req('POST', '/api/proposals',
+    { seg: 5, start: 0, end: 0, replacement: '【核对】', basis: '补记标记' }, rec);
+  assert.strictEqual(p11.status, 201);
+  // 在第2段发布与第5段无关的修订，使 p11 基版过期
+  const seg2v7 = booth.segments.find((s) => s.seg === 2).text;
+  const iShang = cpIndexOf(seg2v7, '3月上旬');
+  const p12 = await req('POST', '/api/proposals',
+    { seg: 2, start: iShang, end: iShang + 4, replacement: '3月初', basis: '录音仅可辨认到月初' }, rec);
+  assert.strictEqual(p12.status, 201);
+  await req('POST', `/api/proposals/${p12.json.id}/adopt`, {}, rev);
+  await req('POST', '/api/publish', { note: '无关修订' }, rev);
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(booth.currentVersion.id === 8, '发布 v8（第5段未被改动）');
+  const pv11 = await req('POST', `/api/proposals/${p11.json.id}/rebase-preview`, {}, rec);
+  ok(pv11.status === 200 && pv11.json.start === 0 && pv11.json.end === 0 && pv11.json.excerpt === '',
+    '零长度选区未被触及：预览成功（插入点不变）');
+  const cf11 = await req('POST', `/api/proposals/${p11.json.id}/rebase-confirm`, { token: pv11.json.token }, rec);
+  ok(cf11.status === 201, '零长度续提确认成功');
+
+  console.log('\n[续提：暂存区交叠与预览后变化]');
+  // p13：基版 v8，第2段范围覆盖“3月初”
+  const seg2v8 = booth.segments.find((s) => s.seg === 2).text;
+  const iChu = cpIndexOf(seg2v8, '3月初');
+  const p13 = await req('POST', '/api/proposals',
+    { seg: 2, start: iChu, end: iChu + 3, replacement: '3月上旬', basis: '再次核对录音' }, rec);
+  assert.strictEqual(p13.status, 201);
+  // p14：第2段前部“申请人张三称”→“申请人张某称”（等长替换，不改变后续偏移），采纳并发布 v9 → p13 过期
+  const iName2 = cpIndexOf(seg2v8, '申请人张三称');
+  const p14 = await req('POST', '/api/proposals',
+    { seg: 2, start: iName2, end: iName2 + 6, replacement: '申请人张某称', basis: '匿名化处理' }, rec);
+  assert.strictEqual(p14.status, 201);
+  await req('POST', `/api/proposals/${p14.json.id}/adopt`, {}, rev);
+  await req('POST', '/api/publish', { note: '匿名化' }, rev);
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(booth.currentVersion.id === 9, '发布 v9（等长替换，后续偏移不变）');
+  ok(booth.proposals.find((x) => x.id === p13.json.id).conflict_kind === 'base_expired', 'p13 标记为基版已过期');
+
+  // 暂存区交叠：p15 与 p13 的换算目标交叠且被采纳
+  const seg2v9 = booth.segments.find((s) => s.seg === 2).text;
+  const iChu9 = cpIndexOf(seg2v9, '3月初');
+  const p15 = await req('POST', '/api/proposals',
+    { seg: 2, start: iChu9, end: iChu9 + 3, replacement: '3月中旬', basis: '第三种说法' }, rec);
+  assert.strictEqual(p15.status, 201);
+  await req('POST', `/api/proposals/${p15.json.id}/adopt`, {}, rev);
+  const pv13a = await req('POST', `/api/proposals/${p13.json.id}/rebase-preview`, {}, rec);
+  ok(pv13a.status === 200 && pv13a.json.stageOverlap && pv13a.json.stageOverlap.id === p15.json.id,
+    '预览提示目标与暂存区已采纳提议交叠');
+  await expectFail(req('POST', `/api/proposals/${p13.json.id}/rebase-confirm`, { token: pv13a.json.token }, rec),
+    409, '交叠', '目标与暂存区交叠，确认被拒绝');
+
+  // 预览后暂存区变化：驳回 p15 后旧凭证失效
+  const pv13b = await req('POST', `/api/proposals/${p13.json.id}/rebase-preview`, {}, rec);
+  await req('POST', `/api/proposals/${p15.json.id}/reject`, { reason: '证据不足' }, rev);
+  await expectFail(req('POST', `/api/proposals/${p13.json.id}/rebase-confirm`, { token: pv13b.json.token }, rec),
+    409, '暂存区', '预览后暂存区变化，旧凭证被拒绝');
+
+  // 重新预览后确认成功
+  const pv13c = await req('POST', `/api/proposals/${p13.json.id}/rebase-preview`, {}, rec);
+  const cf13 = await req('POST', `/api/proposals/${p13.json.id}/rebase-confirm`, { token: pv13c.json.token }, rec);
+  ok(cf13.status === 201, '重新预览后确认成功');
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const N13 = booth.proposals.find((x) => x.id === cf13.json.id);
+  ok(N13.status === 'pending' && N13.base_ver === 9 && N13.rebased_from_id === p13.json.id,
+    '新提议关联原提议并绑定当前基版');
+
+  // 预览后版本变化：采纳 N13 并发布 v10，再用旧凭证确认 → 拒绝
+  await req('POST', `/api/proposals/${cf13.json.id}/adopt`, {}, rev);
+  await req('POST', '/api/publish', { note: '续提再发布' }, rev);
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(booth.currentVersion.id === 10, '发布 v10');
+  await expectFail(req('POST', `/api/proposals/${p13.json.id}/rebase-confirm`, { token: pv13c.json.token }, rec),
+    409, '重新预览', '预览后版本变化，旧凭证被拒绝');
+
+  // 决议留痕：续提决议产生于 v9 发布之后，按水位线语义应出现在 v10 的决议视图中
+  const v10view = (await req('GET', '/api/versions/10', null, par)).json;
+  ok(v10view.decisions.some((d) => d.type === 'rebase' && d.proposal_id === cf13.json.id),
+    '版本决议视图含续提留痕，可追溯');
+
   console.log(`\n全部通过：${passed} 项断言 ✅`);
   process.exit(0);
 }

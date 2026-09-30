@@ -57,7 +57,15 @@ const STATUS_LABEL = {
   pending: '待复核', adopted: '已采纳·暂存', rejected: '已驳回',
   conflicted: '冲突', published: '已发布', active: '有效', needs_relocation: '待重新定位',
 };
-const DECISION_LABEL = { adopt: '采纳', reject: '驳回', conflict: '标记冲突', publish: '发布' };
+const DECISION_LABEL = { adopt: '采纳', reject: '驳回', conflict: '标记冲突', publish: '发布', rebase: '续提' };
+
+// 记录员可对本人“基版已过期”类冲突提议发起续提（换算到当前版本重新提交）
+function canRebase(p) {
+  return me && me.role === 'recordist' && p.status === 'conflicted' &&
+    p.creator_user === me.username &&
+    (p.conflict_kind === 'base_expired' ||
+      (!p.conflict_kind && (p.conflict_reason || '').indexOf('基版已过期') === 0));
+}
 
 // ---------- 启动 / 登录 ----------
 async function boot() {
@@ -420,7 +428,9 @@ function openProposalModal(id) {
     <h3>提议 #${p.id} <span class="tag tag-${p.status}">${STATUS_LABEL[p.status]}</span></h3>
     <div class="card-meta">
       第 ${p.seg} 段 · 范围 [${p.start_cp}, ${p.end_cp}) · 基版 v${p.base_ver}
-      ${p.published_version_id ? `· 已随 v${p.published_version_id} 发布` : ''}<br/>
+      ${p.published_version_id ? `· 已随 v${p.published_version_id} 发布` : ''}
+      ${p.rebased_from_id ? `· 续提自冲突提议 #${p.rebased_from_id}` : ''}
+      ${p.continued_by_id ? `· 已续提为提议 #${p.continued_by_id}` : ''}<br/>
       提交人：${esc(p.creator_name)}（${esc(p.creator_user)}）· ${p.created_at} UTC
     </div>
     <div class="quote">${esc(p.original_excerpt)}</div>
@@ -431,7 +441,11 @@ function openProposalModal(id) {
       <button class="btn" data-close>关闭</button>
       ${actionable && p.status === 'pending' ? '<button class="btn danger" id="p-reject">驳回</button><button class="btn primary" id="p-adopt">采纳</button>' : ''}
       ${actionable && p.status === 'adopted' ? '<button class="btn danger" id="p-reject">驳回（移出暂存区）</button>' : ''}
+      ${canRebase(p) ? '<button class="btn primary" id="p-rebase">续提到当前版本…</button>' : ''}
     </div>`);
+
+  const rebaseBtn = $('#p-rebase');
+  if (rebaseBtn) rebaseBtn.addEventListener('click', () => openRebase(p.id));
 
   const adoptBtn = $('#p-adopt');
   if (adoptBtn) adoptBtn.addEventListener('click', async () => {
@@ -456,6 +470,55 @@ function openProposalModal(id) {
       await reload();
       toast(`提议 #${id} 已驳回`, 'success');
     } catch (err) { toast(err.message, 'error'); await reload(); }
+  });
+}
+
+// ---------- 续提（基版已过期提议的换算重提） ----------
+async function openRebase(id) {
+  try {
+    const pv = await api(`/api/proposals/${id}/rebase-preview`, { method: 'POST' });
+    showRebaseModal(pv);
+  } catch (err) {
+    openModal(`
+      <h3>无法续提</h3>
+      <div class="conflict-reason">${esc(err.message)}</div>
+      <p class="muted">提示：可在左侧当前正文中手工拖选范围，使用“提交修订提议”重新提交。</p>
+      <div class="actions"><button class="btn" data-close>知道了</button></div>`);
+  }
+}
+
+function showRebaseModal(pv) {
+  const stepsDesc = (pv.steps || []).map((s) => `v${s.version}（${s.edits} 项修订）`).join(' → ');
+  openModal(`
+    <h3>续提预览：提议 #${pv.proposalId}</h3>
+    <p class="muted">系统按 v${pv.fromVersion} → v${pv.toVersion} 逐次发布的修订，将原段内选区换算到当前正文；
+      不凭同文搜索猜测位置。确认后生成关联原提议的新待复核提议，原冲突提议保留可追溯。</p>
+    <div class="card-meta">换算路径：${esc(stepsDesc || '无中途修订')}</div>
+    <label>目标选区（当前版本 v${pv.toVersion} · 第 ${pv.seg} 段 · [${pv.start}, ${pv.end})）</label>
+    <div class="quote">${esc(pv.excerpt) || '（零长度选区·插入点）'}</div>
+    <label>原基版 v${pv.fromVersion} 摘录</label>
+    <div class="quote">${esc(pv.originalExcerpt) || '（零长度选区·插入点）'}</div>
+    <div><span class="arrow">替换为 →</span><span class="replacement">${esc(pv.replacement) || '（空串·删除）'}</span></div>
+    <div class="basis" style="margin-top:8px"><b>依据：</b>${esc(pv.basis)}</div>
+    ${pv.stageOverlap ? `<div class="conflict-reason">⚠ 目标选区与当前已采纳提议 #${pv.stageOverlap.id} 交叠，确认将被拒绝；请先处理暂存区，或在当前正文手工选区提交。</div>` : ''}
+    <div class="actions">
+      <button class="btn" data-close>取消</button>
+      <button class="btn primary" id="rb-confirm">确认续提，生成新待复核提议</button>
+    </div>`);
+  $('#rb-confirm').addEventListener('click', async () => {
+    try {
+      const r = await api(`/api/proposals/${pv.proposalId}/rebase-confirm`, {
+        method: 'POST',
+        body: { token: pv.token },
+      });
+      closeModal();
+      await reload();
+      toast(`已生成续提提议 #${r.id}（关联原提议 #${pv.proposalId}），等待复核`, 'success');
+    } catch (err) {
+      closeModal();
+      await reload();
+      toast(`续提被拒绝：${err.message}`, 'error');
+    }
   });
 }
 
@@ -584,6 +647,8 @@ function renderProposals() {
         <span class="card-meta">v${p.base_ver} · ${p.created_at.slice(5, 16)}</span>
       </div>
       <div class="card-meta">第 ${p.seg} 段 [${p.start_cp},${p.end_cp}) · ${esc(p.creator_name)}</div>
+      ${p.rebased_from_id ? `<div class="card-meta">↳ 续提自冲突提议 #${p.rebased_from_id}</div>` : ''}
+      ${p.continued_by_id ? `<div class="card-meta">↳ 已续提为提议 #${p.continued_by_id}</div>` : ''}
       <div class="quote">${esc(p.original_excerpt)}</div>
       <div><span class="arrow">→</span><span class="replacement">${esc(p.replacement) || '（删除）'}</span></div>
       <div class="basis"><b>依据：</b>${esc(p.basis)}</div>
@@ -594,8 +659,15 @@ function renderProposals() {
         ${p.status === 'adopted' ? `<span class="muted">已在暂存区</span>` : ''}
         <button class="btn small danger" data-reject="${p.id}">${p.status === 'adopted' ? '驳回并移出暂存' : '驳回'}</button>
       </div>` : ''}
+      ${canRebase(p) ? `
+      <div class="card-actions">
+        <button class="btn small primary" data-rebase="${p.id}">续提到当前版本…</button>
+      </div>` : ''}
     </div>`;
   }).join('');
+
+  $$('#panel-proposals [data-rebase]').forEach((b) =>
+    b.addEventListener('click', () => openRebase(parseInt(b.dataset.rebase, 10))));
 
   $$('#panel-proposals [data-adopt]').forEach((b) => b.addEventListener('click', async () => {
     const id = parseInt(b.dataset.adopt, 10);
