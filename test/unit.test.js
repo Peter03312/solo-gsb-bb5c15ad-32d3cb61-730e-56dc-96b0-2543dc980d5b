@@ -1,0 +1,50 @@
+'use strict';
+// 纯文本算子单元测试（码点偏移、合版、引用映射）
+const assert = require('assert');
+const { codeLength, sliceCP, validateRange, applyEdits, transformRange } = require('../src/text');
+const { parseTranscript } = require('../src/store');
+
+let n = 0;
+const ok = (c, m) => { assert(c, m); n++; console.log('  ✓', m); };
+
+// 码点计数：emoji 占 1 码点但 2 UTF-16 单元
+const s = 'a😀b';
+ok(codeLength(s) === 3, '😀 按 1 个码点计数');
+ok(sliceCP(s, 1, 2) === '😀', '按码点切出 emoji');
+
+// 范围校验以码点为准
+const vr = validateRange(s, 1, 2);
+ok(vr.excerpt === '😀', '非法范围判定基于码点而非 UTF-16');
+assert.throws(() => validateRange(s, 0, 4), /非法范围/, '越界范围抛错');
+
+// 同段多修订互不重叠：右起合并、彼此不影响
+const text = '甲乙丙丁戊';
+const merged = applyEdits(text, [
+  { start: 0, end: 1, replace: 'X' },     // 甲 -> X
+  { start: 2, end: 3, replace: 'YY' },    // 丙 -> YY
+  { start: 4, end: 5, replace: '' },      // 删除戊
+]);
+ok(merged === 'X乙YY丁', `多处不重叠修订合并为“${merged}”`);
+
+// 引用映射：修订在引用之前 → 平移且仍有效
+let t = transformRange({ start: 3, end: 4 }, [{ start: 0, end: 1, replace: 'XYZ' }]);
+ok(t.start === 5 && t.end === 6 && t.affected === false, '引用在修订之后：平移 +2，不受影响');
+
+// 引用与修订相交 → affected，须重新定位
+t = transformRange({ start: 2, end: 5 }, [{ start: 3, end: 4, replace: 'Q' }]);
+ok(t.affected === true, '引用与修订相交：标记需重新定位');
+
+// 修订在引用之后 → 坐标不变
+t = transformRange({ start: 0, end: 2 }, [{ start: 3, end: 4, replace: 'QQQQ' }]);
+ok(t.start === 0 && t.end === 2 && t.affected === false, '引用在修订之前：坐标不变');
+
+// 解析：段号与自动编号
+const segs = parseTranscript('1. 第一段\n2、第二段\n无段号正文\n4 第四段\n');
+ok(segs.length === 4, `解析 4 段（段号、顿号、空格分隔、自动编号），实际 ${segs.length}`);
+ok(segs[0].seg === 1 && segs[1].seg === 2 && segs[2].seg === 3 && segs[3].seg === 4,
+  '无段号行自动顺延编号为 3，后续显式段号 4 正常');
+
+assert.throws(() => parseTranscript('1. 甲\n1. 乙'), /重复/, '重复段号报错');
+assert.throws(() => parseTranscript('   \n\n'), /空|未解析/, '空稿报错');
+
+console.log(`\n单元测试全部通过：${n} 项 ✅`);

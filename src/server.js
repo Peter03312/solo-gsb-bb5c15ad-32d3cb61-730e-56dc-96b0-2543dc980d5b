@@ -1,0 +1,119 @@
+'use strict';
+const path = require('path');
+const express = require('express');
+const { openDb, verifyPassword } = require('./db');
+const { currentUser, requireAuth, requireRole, createSession, destroySession } = require('./auth');
+const store = require('./store');
+
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const HOST = process.env.HOST || '0.0.0.0';
+
+const db = openDb();
+const app = express();
+app.use(express.json({ limit: '5mb' }));
+app.use(currentUser(db));
+
+function publicUser(u) {
+  return u ? { id: u.id, username: u.username, displayName: u.displayName, role: u.role } : null;
+}
+
+// 统一错误出口：业务错误须写明原因且不改变状态（错误在事务中抛出即回滚）
+function wrap(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
+
+// ---------- 认证 ----------
+app.post('/api/login', wrap((req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: '用户名和密码不能为空' });
+  const row = db.prepare('SELECT * FROM users WHERE username=?').get(username);
+  if (!row || !verifyPassword(password, row.password_hash)) {
+    return res.status(401).json({ error: '用户名或密码错误', code: 'BAD_CREDENTIALS' });
+  }
+  const token = createSession(db, row.id);
+  res.setHeader(
+    'Set-Cookie',
+    `session=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${60 * 60 * 12}`
+  );
+  res.json({
+    user: { id: row.id, username: row.username, displayName: row.display_name, role: row.role },
+  });
+}));
+
+app.post('/api/logout', wrap((req, res) => {
+  destroySession(db, req.sessionToken);
+  res.setHeader('Set-Cookie', 'session=; HttpOnly; Path=/; Max-Age=0');
+  res.json({ ok: true });
+}));
+
+app.get('/api/me', (req, res) => res.json({ user: publicUser(req.user) }));
+
+// ---------- 校订台总览 ----------
+app.get('/api/booth', requireAuth, wrap((_req, res) => {
+  res.json(store.boothView(db));
+}));
+
+// ---------- 导入（记录员，仅一次） ----------
+app.post('/api/doc/import', requireRole('recordist'), wrap((req, res) => {
+  const { title, text } = req.body || {};
+  if (typeof text !== 'string') return res.status(400).json({ error: '缺少 text（UTF-8 逐字稿全文）' });
+  const versionId = store.importTranscript(db, req.user, title, text);
+  res.status(201).json({ ok: true, baseVersionId: versionId });
+}));
+
+// ---------- 提议（记录员） ----------
+app.post('/api/proposals', requireRole('recordist'), wrap((req, res) => {
+  const id = store.createProposal(db, req.user, req.body || {});
+  res.status(201).json({ ok: true, id });
+}));
+
+app.post('/api/proposals/:id/adopt', requireRole('reviewer'), wrap((req, res) => {
+  const result = store.adoptProposal(db, req.user, parseInt(req.params.id, 10));
+  res.json({ ok: true, ...result });
+}));
+
+app.post('/api/proposals/:id/reject', requireRole('reviewer'), wrap((req, res) => {
+  const { reason } = req.body || {};
+  store.rejectProposal(db, req.user, parseInt(req.params.id, 10), reason);
+  res.json({ ok: true });
+}));
+
+// ---------- 发布（复核员） ----------
+app.post('/api/publish', requireRole('reviewer'), wrap((req, res) => {
+  const { note } = req.body || {};
+  const versionId = store.publish(db, req.user, note);
+  res.status(201).json({ ok: true, versionId });
+}));
+
+// ---------- 异议（全部登录用户可提出；重新定位限提出者/复核员，在 store 内校验） ----------
+app.post('/api/objections', requireAuth, wrap((req, res) => {
+  const id = store.createObjection(db, req.user, req.body || {});
+  res.status(201).json({ ok: true, id });
+}));
+
+app.post('/api/objections/:id/relocate', requireAuth, wrap((req, res) => {
+  store.relocateObjection(db, req.user, parseInt(req.params.id, 10), req.body || {});
+  res.json({ ok: true });
+}));
+
+// ---------- 不可变版本视图 ----------
+app.get('/api/versions/:id', requireAuth, wrap((req, res) => {
+  res.json(store.versionView(db, parseInt(req.params.id, 10)));
+}));
+
+// ---------- 静态前端 ----------
+app.use(express.static(path.join(__dirname, '..', 'public')));
+
+// ---------- 错误处理 ----------
+app.use((err, _req, res, _next) => {
+  const status = err.status || 500;
+  if (status >= 500) console.error('[error]', err);
+  res.status(status).json({
+    error: err.message || '服务器内部错误',
+    code: err.code || (status === 500 ? 'INTERNAL' : 'ERROR'),
+  });
+});
+
+app.listen(PORT, HOST, () => {
+  console.log(`听证会校订台已启动：http://localhost:${PORT}`);
+});
