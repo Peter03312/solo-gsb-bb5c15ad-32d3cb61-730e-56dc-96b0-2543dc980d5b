@@ -8,6 +8,8 @@ const fs = require('fs');
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 
 const assert = require('assert');
+const Database = require('better-sqlite3');
+const { hashPassword, DB_PATH } = require('../src/db');
 const BASE = `http://127.0.0.1:${process.env.PORT}`;
 let passed = 0;
 function ok(cond, msg) { assert(cond, msg); passed++; console.log('  ✓', msg); }
@@ -39,6 +41,13 @@ async function login(u, p) {
   return r.setCookie.split(';')[0];
 }
 
+function createUser(username, password, role, displayName) {
+  const db = new Database(DB_PATH);
+  db.prepare('INSERT INTO users (username, display_name, role, password_hash) VALUES (?,?,?,?)')
+    .run(username, displayName, role, hashPassword(password));
+  db.close();
+}
+
 // 码点偏移版 indexOf
 function cpIndexOf(text, needle) {
   const t = Array.from(text), n = Array.from(needle);
@@ -52,9 +61,11 @@ function cpIndexOf(text, needle) {
 async function main() {
   require('../src/server');
   await new Promise((r) => setTimeout(r, 400));
+  createUser('recorder2', 'recorder123', 'recordist', '第二名记录员');
 
   console.log('\n[认证与权限]');
   const rec = await login('recorder', 'recorder123');
+  const rec2 = await login('recorder2', 'recorder123');
   const rev = await login('reviewer', 'reviewer123');
   const par = await login('participant', 'participant123');
   ok(rec && rev && par, '三类用户登录成功');
@@ -242,6 +253,92 @@ async function main() {
   ok(booth.currentVersion.id === 4, '发布 v4');
   const oAfter = booth.objections.find((x) => x.id === oid);
   ok(oAfter.anchor_status === 'active', '不相交修订发布后，已重定位异议保持 active（不回退）');
+
+  console.log('\n[过期提议续提：权限、预览、确认和暂存区失效]');
+  const staleId = p4.json.id; // v1 中“王五→王武”，v2-v4 均未触及第4段该选区
+  await expectFail(req('POST', `/api/proposals/${staleId}/renew-preview`, {}, rec2),
+    403, '无权续提', '非本人尝试续提');
+  await expectFail(req('POST', `/api/proposals/${p2.json.id}/renew-preview`, {}, rec),
+    409, '不是“因发布导致基版已过期”', '范围交叠冲突不能续提');
+
+  let rv = await req('POST', `/api/proposals/${staleId}/renew-preview`, {}, rec);
+  assert.strictEqual(rv.status, 200, `续提预览应成功：${JSON.stringify(rv.json)}`);
+  let preview = rv.json.preview;
+  ok(preview.eligible === true, '未触及且暂存区不交叠时预览可确认');
+  ok(preview.currentVersionId === 4, '预览基于当前 v4');
+  ok(preview.target.seg === 4 && preview.target.excerpt === '王五' &&
+     preview.target.start !== undefined && preview.target.end === preview.target.start + 2,
+    '逐版换算显示当前目标选区与摘录“王五”');
+  ok(preview.originalProposal.replacement === '王武' && preview.originalProposal.basis === '笔误',
+    '预览显示原替换文字和依据');
+  ok(preview.path.length === 3, '预览给出 v1→v2→v3→v4 的逐次发布换算依据');
+
+  // 暂存区在预览后变化：目标被已采纳修订占据时预览不可确认；恢复后旧凭证也必须重新预览
+  let seg4now = (await req('GET', '/api/booth', null, rec)).json.segments.find((s) => s.seg === 4).text;
+  let iWang = cpIndexOf(seg4now, '王五');
+  const blocker = await req('POST', '/api/proposals',
+    { seg: 4, start: iWang, end: iWang + 2, replacement: '王伍临时', basis: '暂存交叠测试' }, rec);
+  assert.strictEqual(blocker.status, 201);
+  await req('POST', `/api/proposals/${blocker.json.id}/adopt`, {}, rev);
+  rv = await req('POST', `/api/proposals/${staleId}/renew-preview`, {}, rec);
+  assert.strictEqual(rv.status, 200);
+  ok(rv.json.preview.eligible === false && rv.json.preview.blockedReason.includes('交叠'),
+    '目标与当前已采纳提议交叠时预览不可确认');
+  await req('POST', `/api/proposals/${blocker.json.id}/reject`, { reason: '清理暂存' }, rev);
+  await expectFail(req('POST', '/api/proposals/renew-confirm', { token: preview.token }, rec),
+    409, '暂存区已变化', '旧预览凭证在暂存区变化后确认被拒绝');
+  rv = await req('POST', `/api/proposals/${staleId}/renew-preview`, {}, rec);
+  assert.strictEqual(rv.status, 200, `重新预览应成功：${JSON.stringify(rv.json)}`);
+  preview = rv.json.preview;
+  ok(preview.eligible === true, '暂存区恢复不重叠后重新预览可确认');
+
+  const cf = await req('POST', '/api/proposals/renew-confirm', { token: preview.token }, rec);
+  assert.strictEqual(cf.status, 201, `确认续提应成功：${JSON.stringify(cf.json)}`);
+  const renewedId = cf.json.id;
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const renewed = booth.proposals.find((x) => x.id === renewedId);
+  ok(renewed.status === 'pending' && renewed.base_ver === 4 &&
+     renewed.renewed_from_id === staleId && renewed.original_excerpt === '王五',
+    `确认后生成关联原提议 #${staleId} 的新待复核提议 #${renewedId}`);
+  await expectFail(req('POST', `/api/proposals/${staleId}/renew-preview`, {}, rec),
+    409, '已生成续提', '同一原冲突提议不能重复续提');
+  const v4history = (await req('GET', '/api/versions/4', null, par)).json;
+  ok(v4history.segments.find((s) => s.seg === 4).text.includes('王五'),
+    '续提不修改历史版本正文');
+
+  console.log('\n[过期提议续提：中途触及选区和零长度插入点]');
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  seg4now = booth.segments.find((s) => s.seg === 4).text;
+  const iAfternoonPhrase = cpIndexOf(seg4now, '当天下午');
+  const iAfternoon = cpIndexOf(seg4now, '下午');
+  const pTouched = await req('POST', '/api/proposals',
+    { seg: 4, start: iAfternoonPhrase, end: iAfternoonPhrase + 4, replacement: '当日午后', basis: '触及选区测试' }, rec);
+  assert.strictEqual(pTouched.status, 201);
+  const pTouchEdit = await req('POST', '/api/proposals',
+    { seg: 4, start: iAfternoon, end: iAfternoon + 2, replacement: '午后', basis: '触及内部' }, rec);
+  assert.strictEqual(pTouchEdit.status, 201);
+  await req('POST', `/api/proposals/${pTouchEdit.json.id}/adopt`, {}, rev);
+  let pub5 = await req('POST', '/api/publish', { note: '触及续提选区' }, rev);
+  assert.strictEqual(pub5.status, 201);
+  ok(pub5.json.versionId === 5, '发布 v5');
+  await expectFail(req('POST', `/api/proposals/${pTouched.json.id}/renew-preview`, {}, rec),
+    409, '已被', '中途修订触及非空选区时拒绝续提');
+
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  seg4now = booth.segments.find((s) => s.seg === 4).text;
+  const iSceneEnd = cpIndexOf(seg4now, '现场') + 2;
+  const pZero = await req('POST', '/api/proposals',
+    { seg: 4, start: iSceneEnd, end: iSceneEnd, replacement: '（插入）', basis: '零长度插入点测试' }, rec);
+  assert.strictEqual(pZero.status, 201);
+  const pZeroEdit = await req('POST', '/api/proposals',
+    { seg: 4, start: iSceneEnd, end: iSceneEnd, replacement: '★', basis: '同点插入发布' }, rec);
+  assert.strictEqual(pZeroEdit.status, 201);
+  await req('POST', `/api/proposals/${pZeroEdit.json.id}/adopt`, {}, rev);
+  const pub6 = await req('POST', '/api/publish', { note: '触及插入点' }, rev);
+  assert.strictEqual(pub6.status, 201);
+  ok(pub6.json.versionId === 6, '发布 v6');
+  await expectFail(req('POST', `/api/proposals/${pZero.json.id}/renew-preview`, {}, rec),
+    409, '插入点', '中途修订触及零长度插入点时拒绝续提');
 
   console.log(`\n全部通过：${passed} 项断言 ✅`);
   process.exit(0);

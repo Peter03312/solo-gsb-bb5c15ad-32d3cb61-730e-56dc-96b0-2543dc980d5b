@@ -25,6 +25,7 @@ function openDb() {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   initSchema(db);
+  migrateSchema(db);
   seed(db);
   return db;
 }
@@ -75,12 +76,14 @@ function initSchema(db) {
     original_excerpt TEXT NOT NULL, -- 基版原文快照
     base_version_id INTEGER NOT NULL REFERENCES versions(id),
     status      TEXT NOT NULL CHECK (status IN ('pending','adopted','rejected','conflicted','published')),
+    conflict_kind TEXT NOT NULL DEFAULT 'stale_base' CHECK (conflict_kind IN ('stale_base','range_overlap')),
     conflict_reason TEXT NOT NULL DEFAULT '',
     created_by  INTEGER NOT NULL REFERENCES users(id),
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     decided_by  INTEGER REFERENCES users(id),
     decided_at  TEXT,
-    published_version_id INTEGER REFERENCES versions(id)
+    published_version_id INTEGER REFERENCES versions(id),
+    renewed_from_proposal_id INTEGER REFERENCES proposals(id)
   );
 
   -- 决议（不可变审计流；驳回/采纳/冲突/发布均留痕）
@@ -130,9 +133,30 @@ function initSchema(db) {
   );
 
   CREATE INDEX IF NOT EXISTS idx_proposals_base ON proposals(base_version_id, status);
+  CREATE INDEX IF NOT EXISTS idx_proposals_renewed ON proposals(renewed_from_proposal_id);
   CREATE INDEX IF NOT EXISTS idx_decisions_version ON decisions(version_id);
   CREATE INDEX IF NOT EXISTS idx_anchors_version ON objection_anchors(version_id);
   `);
+}
+
+function tableColumns(db, table) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+}
+
+function migrateSchema(db) {
+  const cols = tableColumns(db, 'proposals');
+  if (!cols.includes('conflict_kind')) {
+    db.exec(`ALTER TABLE proposals ADD COLUMN conflict_kind TEXT NOT NULL DEFAULT 'stale_base'`);
+    db.prepare(
+      `UPDATE proposals
+       SET conflict_kind='range_overlap'
+       WHERE status='conflicted' AND conflict_reason LIKE '%交叠%'`
+    ).run();
+  }
+  if (!cols.includes('renewed_from_proposal_id')) {
+    db.exec(`ALTER TABLE proposals ADD COLUMN renewed_from_proposal_id INTEGER REFERENCES proposals(id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_proposals_renewed ON proposals(renewed_from_proposal_id)`);
+  }
 }
 
 function seed(db) {

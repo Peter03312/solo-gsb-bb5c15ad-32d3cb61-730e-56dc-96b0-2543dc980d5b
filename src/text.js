@@ -64,4 +64,46 @@ function transformRange(range, edits) {
   return { start, end, affected };
 }
 
-module.exports = { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange };
+// 续提时跨版本严格换算选区。任一已发布修订触及非空选区，或触及零长度选区的插入点，
+// 都返回 touched=true；调用方必须拒绝自动续提，不得再用同文搜索猜测位置。
+// 相邻半开区间（[0,2) 与 [2,4)）对非空选区不算触及；零长度插入点在边界上也视为被触及。
+function transformRangeStrict(range, edits) {
+  let start = range.start;
+  let end = range.end;
+  let touched = false;
+  let touch = null;
+  for (const e of edits.slice().sort((a, b) => a.start - a.start)) {
+    const d = codeLength(e.replace) - (e.end - e.start);
+    if (start === end) {
+      if (e.start <= start && start <= e.end) {
+        touched = true;
+        touch = e;
+        break;
+      }
+      if (e.end <= start) {
+        start += d;
+        end += d;
+      }
+    } else if (e.end <= start) {
+      start += d;
+      end += d;
+    } else if (e.start >= end) {
+      // 修订完全在选区之后，不变
+    } else {
+      touched = true;
+      touch = e;
+      break;
+    }
+  }
+  return { start, end, touched, touch };
+}
+
+module.exports = {
+  codeLength,
+  sliceCP,
+  validateRange,
+  overlaps,
+  applyEdits,
+  transformRange,
+  transformRangeStrict,
+};

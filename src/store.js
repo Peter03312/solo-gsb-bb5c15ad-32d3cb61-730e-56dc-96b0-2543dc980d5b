@@ -1,6 +1,15 @@
 'use strict';
-// 业务核心：导入、提议、采纳/驳回、冲突标记、发布合版、版本视图、异议引用
-const { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange } = require('./text');
+// 业务核心：导入、提议、采纳/驳回、冲突标记、发布合版、版本视图、异议引用、过期提议续提
+const crypto = require('crypto');
+const {
+  codeLength,
+  sliceCP,
+  validateRange,
+  overlaps,
+  applyEdits,
+  transformRange,
+  transformRangeStrict,
+} = require('./text');
 
 // ---------- 解析 ----------
 // 行首段号格式： 12. 文字 / 12、文字 / 12 制表符或空格 + 文字；单独一行 "12" 视为空文段。
@@ -38,6 +47,9 @@ function badRequest(msg, code = 'BAD_REQUEST') {
 }
 function conflict(msg, code = 'CONFLICT') {
   return Object.assign(new Error(msg), { status: 409, code });
+}
+function forbidden(msg, code = 'FORBIDDEN') {
+  return Object.assign(new Error(msg), { status: 403, code });
 }
 function notFound(msg) {
   return Object.assign(new Error(msg), { status: 404, code: 'NOT_FOUND' });
@@ -113,6 +125,7 @@ function createProposal(db, actor, body) {
 
   const insert = db.transaction(() => {
     let status = 'pending';
+    let conflictKind = 'stale_base';
     let conflictReason = '';
     // 与同一基版上已采纳（暂存待发布）的修订范围交叠 → 直接标记冲突，绝不覆盖
     const clash = db
@@ -124,13 +137,15 @@ function createProposal(db, actor, body) {
       .get(base.id, seg, vr.end, vr.start);
     if (clash) {
       status = 'conflicted';
+      conflictKind = 'range_overlap';
       conflictReason = `与已采纳提议 #${clash.id} 的范围 [${clash.start_cp},${clash.end_cp}) 交叠；不能覆盖其他修订，请改提互不重叠的范围`;
     }
     const r = db.prepare(
       `INSERT INTO proposals
-        (seg, start_cp, end_cp, replacement, basis, original_excerpt, base_version_id, status, conflict_reason, created_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`
-    ).run(seg, start, end, replacement, basis, vr.excerpt, base.id, status, conflictReason, actor.id);
+        (seg, start_cp, end_cp, replacement, basis, original_excerpt, base_version_id,
+         status, conflict_kind, conflict_reason, created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(seg, start, end, replacement, basis, vr.excerpt, base.id, status, conflictKind, conflictReason, actor.id);
     const id = r.lastInsertRowid;
     if (status === 'conflicted') {
       addDecision(db, {
@@ -156,14 +171,15 @@ function adoptProposal(db, actor, id) {
   if (p.status === 'adopted') throw conflict(`提议 #${id} 已在暂存区，请勿重复采纳`, 'ALREADY_ADOPTED');
 
   const cur = latestVersion(db);
-  const markConflict = db.transaction((reason) => {
-    db.prepare(`UPDATE proposals SET status='conflicted', conflict_reason=? WHERE id=?`).run(reason, id);
+  const markConflict = db.transaction((reason, kind) => {
+    db.prepare(`UPDATE proposals SET status='conflicted', conflict_kind=?, conflict_reason=? WHERE id=?`)
+      .run(kind, reason, id);
     addDecision(db, { type: 'conflict', proposalId: id, versionId: cur.id, actorId: actor.id, reason });
   });
 
   if (p.base_version_id !== cur.id) {
     const reason = `基版已过期：提议提交时绑定 v${p.base_version_id}，当前已发布版本为 v${cur.id}；请基于 v${cur.id} 重新提交`;
-    markConflict(reason);
+    markConflict(reason, 'stale_base');
     return { markedConflict: true, reason };
   }
   const clash = db
@@ -175,7 +191,7 @@ function adoptProposal(db, actor, id) {
     .get(cur.id, p.seg, id, p.end_cp, p.start_cp);
   if (clash) {
     const reason = `范围交叠：提议 #${id} [${p.start_cp},${p.end_cp}) 与已采纳提议 #${clash.id} [${clash.start_cp},${clash.end_cp}) 冲突；不能覆盖其他修订`;
-    markConflict(reason);
+    markConflict(reason, 'range_overlap');
     return { markedConflict: true, reason };
   }
   db.transaction(() => {
@@ -206,6 +222,281 @@ function rejectProposal(db, actor, id, reason) {
       reason: reason || '',
       detail: { previousStatus: from },
     });
+  })();
+}
+
+// ---------- 基版过期提议的续提 ----------
+const RENEW_TOKEN_SECRET =
+  process.env.RENEW_TOKEN_SECRET || 'hearing-revision-console.renew-preview.v1';
+
+function b64url(input) {
+  return Buffer.from(input).toString('base64url');
+}
+function b64urlJson(obj) {
+  return b64url(JSON.stringify(obj));
+}
+function fromB64urlJson(s) {
+  return JSON.parse(Buffer.from(s, 'base64url').toString('utf8'));
+}
+function signRenewToken(payload) {
+  const body = b64urlJson(payload);
+  const sig = crypto.createHmac('sha256', RENEW_TOKEN_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+function verifyRenewToken(token) {
+  if (typeof token !== 'string' || !token.includes('.')) {
+    throw badRequest('续提确认凭证无效，请重新预览', 'BAD_RENEW_TOKEN');
+  }
+  const [body, sig] = token.split('.');
+  const expected = crypto.createHmac('sha256', RENEW_TOKEN_SECRET).update(body).digest('base64url');
+  const sigBuf = Buffer.from(sig || '', 'base64url');
+  const expBuf = Buffer.from(expected, 'base64url');
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    throw badRequest('续提确认凭证无效，请重新预览', 'BAD_RENEW_TOKEN');
+  }
+  try {
+    return fromB64urlJson(body);
+  } catch (_e) {
+    throw badRequest('续提确认凭证无效，请重新预览', 'BAD_RENEW_TOKEN');
+  }
+}
+function sha256(s) {
+  return crypto.createHash('sha256').update(s).digest('hex');
+}
+function stageFingerprint(db, versionId) {
+  const stage = stageProposals(db, versionId);
+  const material = stage
+    .map((p) => `${p.id}:${p.seg}:${p.start_cp}:${p.end_cp}:${p.replacement}`)
+    .join('\n');
+  return sha256(`${versionId}\n${material}`);
+}
+function stageDecisionVersion(db) {
+  // 任一采纳/驳回都会改变暂存区；即使之后又回到相同内容，也要求旧预览重新确认。
+  return db.prepare(`SELECT COALESCE(MAX(id),0) AS v FROM decisions WHERE type IN ('adopt','reject')`).get().v;
+}
+function assertRenewableProposal(db, actor, id) {
+  const p = db.prepare('SELECT * FROM proposals WHERE id=?').get(id);
+  if (!p) throw notFound(`提议 #${id} 不存在`);
+  if (p.created_by !== actor.id) {
+    throw forbidden(`无权续提：只有提议 #${id} 的提交者本人可以发起续提`, 'NOT_OWN_PROPOSAL');
+  }
+  if (p.status !== 'conflicted' || p.conflict_kind !== 'stale_base') {
+    throw conflict(
+      `提议 #${id} 不是“因发布导致基版已过期”的冲突提议，不能续提；请在当前正文手工选区提交`,
+      'NOT_STALE_BASE'
+    );
+  }
+  const already = db
+    .prepare('SELECT id FROM proposals WHERE renewed_from_proposal_id=? ORDER BY id DESC LIMIT 1')
+    .get(id);
+  if (already) {
+    throw conflict(`提议 #${id} 已生成续提提议 #${already.id}，请在新提议上继续处理`, 'ALREADY_RENEWED');
+  }
+  return p;
+}
+function publishedEdits(db, baseVersionId, publishedVersionId, seg) {
+  return db
+    .prepare(
+      `SELECT id, seg, start_cp, end_cp, replacement
+       FROM proposals
+       WHERE status='published'
+         AND base_version_id=? AND published_version_id=? AND seg=?
+       ORDER BY start_cp, id`
+    )
+    .all(baseVersionId, publishedVersionId, seg)
+    .map((e) => ({ id: e.id, start: e.start_cp, end: e.end_cp, replace: e.replacement }));
+}
+
+// 按从原基版到当前版的每一次发布逐步换算，绝不通过同文搜索猜测选区。
+function mapStaleProposalRange(db, p) {
+  const cur = latestVersion(db);
+  if (!cur || cur.id <= p.base_version_id) {
+    throw conflict(`提议 #${p.id} 当前没有可续提的新版本，请刷新后重试`, 'NOT_STALE_BASE');
+  }
+  const baseVersion = db.prepare('SELECT * FROM versions WHERE id=?').get(p.base_version_id);
+  if (!baseVersion) throw conflict(`原基版 v${p.base_version_id} 不存在，无法续提`, 'PREVIEW_STALE');
+
+  let baseSegments = segmentsOf(baseVersion);
+  let idx = segIndex(baseSegments, p.seg);
+  if (idx === -1) throw conflict('原选区所在段落缺失，无法自动续提；请在当前正文手工选区提交', 'PREVIEW_STALE');
+  const baseExcerpt = sliceCP(baseSegments[idx].text, p.start_cp, p.end_cp);
+  if (baseExcerpt !== p.original_excerpt) {
+    throw conflict('原摘录与历史版本不一致，无法自动续提；请在当前正文手工选区提交', 'PREVIEW_STALE');
+  }
+
+  let start = p.start_cp;
+  let end = p.end_cp;
+  const path = [];
+  for (let fromId = p.base_version_id; fromId < cur.id; fromId++) {
+    const toId = fromId + 1;
+    const toVersion = db.prepare('SELECT * FROM versions WHERE id=?').get(toId);
+    if (!toVersion) throw conflict('原基版之后的发布历史不完整，无法自动续提', 'PREVIEW_STALE');
+    const edits = publishedEdits(db, fromId, toId, p.seg);
+    path.push({
+      fromVersion: fromId,
+      toVersion: toId,
+      edits: edits.map((e) => ({
+        id: e.id,
+        seg: p.seg,
+        start: e.start,
+        end: e.end,
+        replacement: e.replace,
+      })),
+    });
+    const t = transformRangeStrict({ start, end }, edits);
+    if (t.touched) {
+      const at = t.touch;
+      const reason = start === end
+        ? `零长度选区的插入点 [${start},${start}) 已被 v${toId} 中提议 #${at.id} 的修订触及；请在当前正文手工定位插入点后提交`
+        : `原选区 [${p.start_cp},${p.end_cp}) 已被 v${toId} 中提议 #${at.id} 的修订触及，不能自动续提；请在当前正文重新手工选区提交`;
+      throw conflict(reason, 'SELECTION_TOUCHED');
+    }
+    start = t.start;
+    end = t.end;
+    const toSegments = segmentsOf(toVersion);
+    const toIdx = segIndex(toSegments, p.seg);
+    if (toIdx === -1) {
+      throw conflict('目标段在后续版本中缺失，不能自动续提；请在当前正文手工选区提交', 'TARGET_SEG_MISSING');
+    }
+    try {
+      validateRange(toSegments[toIdx].text, start, end);
+    } catch (_e) {
+      throw conflict('换算后的目标选区超出当前段长度，请在当前正文手工选区提交', 'PREVIEW_STALE');
+    }
+    baseSegments = toSegments;
+    idx = toIdx;
+  }
+
+  const currentSegments = segmentsOf(cur);
+  const curIdx = segIndex(currentSegments, p.seg);
+  if (curIdx === -1) {
+    throw conflict('目标段在当前正文中缺失，不能自动续提；请在当前正文手工选区提交', 'TARGET_SEG_MISSING');
+  }
+  validateRange(currentSegments[curIdx].text, start, end);
+  const targetExcerpt = sliceCP(currentSegments[curIdx].text, start, end);
+  if (targetExcerpt !== p.original_excerpt) {
+    throw conflict('中途修订已改变原选区文字，不能自动续提；请在当前正文手工选区提交', 'SELECTION_TOUCHED');
+  }
+  return { currentVersion: cur, start, end, targetExcerpt, path };
+}
+function currentStageOverlap(db, versionId, seg, start, end) {
+  return db
+    .prepare(
+      `SELECT * FROM proposals
+       WHERE status='adopted' AND base_version_id=? AND seg=?
+         AND start_cp < ? AND ? < end_cp
+       ORDER BY id LIMIT 1`
+    )
+    .get(versionId, seg, end, start);
+}
+function renewProposalPreview(db, actor, id) {
+  const p = assertRenewableProposal(db, actor, id);
+  const mapped = mapStaleProposalRange(db, p);
+  const clash = currentStageOverlap(db, mapped.currentVersion.id, p.seg, mapped.start, mapped.end);
+  const eligible = !clash;
+  const blockedReason = clash
+    ? `目标选区与当前暂存区中已采纳提议 #${clash.id} [${clash.start_cp},${clash.end_cp}) 交叠；请等待发布/驳回后重新预览，或手工选择不重叠范围`
+    : '';
+  const token = signRenewToken({
+    pid: p.id,
+    vid: mapped.currentVersion.id,
+    seg: p.seg,
+    start: mapped.start,
+    end: mapped.end,
+    excerptHash: sha256(mapped.targetExcerpt),
+    sf: stageFingerprint(db, mapped.currentVersion.id),
+    sv: stageDecisionVersion(db),
+  });
+  return {
+    originalProposal: {
+      id: p.id,
+      seg: p.seg,
+      start: p.start_cp,
+      end: p.end_cp,
+      replacement: p.replacement,
+      basis: p.basis,
+      excerpt: p.original_excerpt,
+      baseVersionId: p.base_version_id,
+      conflictReason: p.conflict_reason,
+    },
+    currentVersionId: mapped.currentVersion.id,
+    target: {
+      seg: p.seg,
+      start: mapped.start,
+      end: mapped.end,
+      excerpt: mapped.targetExcerpt,
+      length: codeLength(mapped.targetExcerpt),
+    },
+    eligible,
+    blockedReason,
+    path: mapped.path,
+    token,
+  };
+}
+function confirmRenewProposal(db, actor, token) {
+  const payload = verifyRenewToken(token);
+  const p = assertRenewableProposal(db, actor, payload.pid);
+  const already = db
+    .prepare('SELECT id FROM proposals WHERE renewed_from_proposal_id=? ORDER BY id DESC LIMIT 1')
+    .get(p.id);
+  if (already) {
+    throw conflict(`原提议 #${p.id} 已生成续提提议 #${already.id}，请在新提议上继续处理`, 'ALREADY_RENEWED');
+  }
+  const cur = latestVersion(db);
+  if (!cur || cur.id !== payload.vid) {
+    throw conflict('预览后已发布新版本，凭证已失效；请重新预览', 'PREVIEW_STALE');
+  }
+  if (payload.sf !== stageFingerprint(db, cur.id) || payload.sv !== stageDecisionVersion(db)) {
+    throw conflict('预览后发布暂存区已变化，凭证已失效；请重新预览', 'PREVIEW_STALE');
+  }
+  const mapped = mapStaleProposalRange(db, p);
+  if (mapped.currentVersion.id !== payload.vid || p.seg !== payload.seg ||
+      mapped.start !== payload.start || mapped.end !== payload.end ||
+      sha256(mapped.targetExcerpt) !== payload.excerptHash) {
+    throw conflict('预览内容与当前正文不一致，请重新预览', 'PREVIEW_STALE');
+  }
+  if (replacementHasNewline(p.replacement)) {
+    throw badRequest('原替换文字包含换行，不能沿用，请在当前正文手工选区提交', 'BAD_RENEWAL');
+  }
+  if (!p.basis || !p.basis.trim()) {
+    throw badRequest('原修订依据为空，不能沿用，请在当前正文手工选区提交', 'BAD_RENEWAL');
+  }
+  const clash = currentStageOverlap(db, cur.id, p.seg, mapped.start, mapped.end);
+  if (clash) {
+    throw conflict(
+      `目标选区与当前已采纳提议 #${clash.id} [${clash.start_cp},${clash.end_cp}) 交叠；请重新预览或手工选择不重叠范围`,
+      'TARGET_OVERLAPS_STAGE'
+    );
+  }
+
+  return db.transaction(() => {
+    const r = db.prepare(
+      `INSERT INTO proposals
+        (seg, start_cp, end_cp, replacement, basis, original_excerpt, base_version_id,
+         status, conflict_kind, conflict_reason, created_by, renewed_from_proposal_id)
+       VALUES (?,?,?,?,?,?,?, 'pending', 'stale_base', '', ?, ?)`
+    ).run(
+      p.seg, mapped.start, mapped.end, p.replacement, p.basis, mapped.targetExcerpt,
+      cur.id, actor.id, p.id
+    );
+    const newId = r.lastInsertRowid;
+    addDecision(db, {
+      type: 'renew',
+      proposalId: p.id,
+      versionId: cur.id,
+      actorId: actor.id,
+      reason: `续提为新提议 #${newId}（原提议 #${p.id} 基版 v${p.base_version_id}）`,
+      detail: {
+        newProposalId: newId,
+        originalProposalId: p.id,
+        seg: p.seg,
+        originalStart: p.start_cp,
+        originalEnd: p.end_cp,
+        targetStart: mapped.start,
+        targetEnd: mapped.end,
+      },
+    });
+    return { id: newId, originalProposalId: p.id, target: { seg: p.seg, start: mapped.start, end: mapped.end } };
   })();
 }
 
@@ -268,7 +559,8 @@ function publish(db, actor, note) {
     const stale = db.prepare(`SELECT * FROM proposals WHERE status='pending'`).all();
     for (const p of stale) {
       const reason = `基版已过期：提议提交时绑定 v${p.base_version_id}，发布后当前版本为 v${newId}；请基于新版本重新提交`;
-      db.prepare(`UPDATE proposals SET status='conflicted', conflict_reason=? WHERE id=?`).run(reason, p.id);
+      db.prepare(`UPDATE proposals SET status='conflicted', conflict_kind='stale_base', conflict_reason=? WHERE id=?`)
+        .run(reason, p.id);
       addDecision(db, { type: 'conflict', proposalId: p.id, versionId: newId, actorId: null, reason });
     }
 
@@ -408,10 +700,13 @@ function listProposals(db) {
   return db
     .prepare(
       `SELECT p.*, u.display_name AS creator_name, u.username AS creator_user,
-              b.id AS base_ver
+              b.id AS base_ver,
+              rp.id AS renewed_from_id, rp.start_cp AS renewed_from_start,
+              rp.end_cp AS renewed_from_end, rp.base_version_id AS renewed_from_base
        FROM proposals p
        JOIN users u ON u.id = p.created_by
        JOIN versions b ON b.id = p.base_version_id
+       LEFT JOIN proposals rp ON rp.id = p.renewed_from_proposal_id
        ORDER BY p.id DESC`
     )
     .all();
@@ -502,6 +797,8 @@ module.exports = {
   parseTranscript,
   importTranscript,
   createProposal,
+  renewProposalPreview,
+  confirmRenewProposal,
   adoptProposal,
   rejectProposal,
   publish,

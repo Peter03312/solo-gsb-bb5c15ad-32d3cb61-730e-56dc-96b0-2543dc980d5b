@@ -57,7 +57,7 @@ const STATUS_LABEL = {
   pending: '待复核', adopted: '已采纳·暂存', rejected: '已驳回',
   conflicted: '冲突', published: '已发布', active: '有效', needs_relocation: '待重新定位',
 };
-const DECISION_LABEL = { adopt: '采纳', reject: '驳回', conflict: '标记冲突', publish: '发布' };
+const DECISION_LABEL = { adopt: '采纳', reject: '驳回', conflict: '标记冲突', publish: '发布', renew: '续提' };
 
 // ---------- 启动 / 登录 ----------
 async function boot() {
@@ -301,14 +301,19 @@ document.addEventListener('mouseup', onSelection);
 document.addEventListener('touchend', () => setTimeout(onSelection, 10));
 document.addEventListener('selectionchange', () => {
   const sel = window.getSelection();
-  if (!sel.rangeCount || sel.isCollapsed) hideSelectionToolbar();
+  if (sel && !sel.isCollapsed) return;
+  if (booth && booth.initialized && viewMode === 'base' && me.role === 'recordist') {
+    onSelection();
+    return;
+  }
+  hideSelectionToolbar();
 });
 
 function onSelection() {
   hideSelectionToolbar();
   if (!booth || !booth.initialized || viewMode !== 'base') return;
   const sel = window.getSelection();
-  if (!sel.rangeCount || sel.isCollapsed) return;
+  if (!sel.rangeCount) return;
   const range = sel.getRangeAt(0);
   const aBody = range.startContainer.parentElement && range.startContainer.parentElement.closest('.seg-body');
   const bBody = range.endContainer.parentElement && range.endContainer.parentElement.closest('.seg-body');
@@ -319,17 +324,18 @@ function onSelection() {
   const seg = parseInt(aBody.dataset.seg, 10);
   const s = cpOffsetInSeg(aBody, range.startContainer, range.startOffset);
   const en = cpOffsetInSeg(aBody, range.endContainer, range.endOffset);
-  if (s == null || en == null || s === en) return;
+  if (s == null || en == null) return;
   const start = Math.min(s, en), end = Math.max(s, en);
+  if (start === end && me.role !== 'recordist') return;
   const text = segText(seg, booth.segments);
   currentSelection = { seg, start, end, excerpt: cpSlice(text, start, end) };
 
   const bar = $('#selection-toolbar');
   bar.innerHTML = '';
   if (me.role === 'recordist') {
-    bar.appendChild(toolButton('✏ 提交修订提议', openProposalForm));
+    bar.appendChild(toolButton(start === end ? '✏ 在此插入并提交修订' : '✏ 提交修订提议', openProposalForm));
   }
-  bar.appendChild(toolButton('⚑ 提出异议引用', openObjectionForm));
+  if (start !== end) bar.appendChild(toolButton('⚑ 提出异议引用', openObjectionForm));
   bar.classList.remove('hidden');
   const rect = range.getBoundingClientRect();
   bar.style.position = 'fixed';
@@ -351,9 +357,9 @@ function openProposalForm() {
   if (!sel) return;
   openModal(`
     <h3>提交修订提议（第 ${sel.seg} 段）</h3>
-    <p class="muted">提议将绑定当前已发布版本 v${booth.currentVersion.id}。范围：[${sel.start}, ${sel.end})，共 ${sel.end - sel.start} 个字符。</p>
-    <div class="sel-quote">${esc(sel.excerpt)}</div>
-    <label>替换文字（空串表示删除该范围；不得含换行）
+    <p class="muted">提议将绑定当前已发布版本 v${booth.currentVersion.id}。范围：[${sel.start}, ${sel.end})，${sel.end === sel.start ? '零长度插入点' : `共 ${sel.end - sel.start} 个字符`}。</p>
+    <div class="sel-quote">${esc(sel.excerpt) || '（空串·插入点）'}</div>
+    <label>替换文字${sel.end === sel.start ? '（插入文字；空串没有效果）' : '（空串表示删除该范围；不得含换行）'}
       <textarea id="f-replace" rows="3"></textarea>
     </label>
     <label>修订依据 <em style="color:var(--danger)">*</em>
@@ -408,6 +414,73 @@ function openObjectionForm() {
   });
 }
 
+// ---------- 基版过期提议续提 ----------
+function canRenewProposal(p) {
+  return me.role === 'recordist' &&
+    p.creator_user === me.username &&
+    p.status === 'conflicted' &&
+    p.conflict_kind === 'stale_base' &&
+    !hasRenewal(p.id);
+}
+
+function hasRenewal(originalId) {
+  return booth.proposals.some((x) => x.renewed_from_id === originalId);
+}
+
+async function openRenewPreview(id) {
+  let data;
+  try {
+    const r = await api(`/api/proposals/${id}/renew-preview`, { method: 'POST' });
+    data = r.preview;
+  } catch (err) {
+    toast(err.message, 'error');
+    return;
+  }
+  const o = data.originalProposal;
+  const pathLines = data.path
+    .map((step) => {
+      const desc = step.edits.length
+        ? step.edits.map((e) => `#${e.id} [${e.start},${e.end})→“${e.replacement || '（删除）'}”`).join('；')
+        : '该段无发布修订（仅平移版本链）';
+      return `<li>v${step.fromVersion} → v${step.toVersion}：${desc}</li>`;
+    })
+    .join('');
+  openModal(`
+    <h3>续提预览：原提议 #${o.id}</h3>
+    <div class="snapshot-note">
+      系统已按 v${o.baseVersionId} 到 v${data.currentVersionId} 的逐次发布修订换算；未使用同文搜索猜测位置。
+    </div>
+    <label>原提议（v${o.baseVersionId}，第 ${o.seg} 段，[${o.start},${o.end})）摘录</label>
+    <div class="quote">${esc(o.excerpt) || '（空串·插入点）'}</div>
+    <div><span class="arrow">原替换文字 →</span><span class="replacement">${esc(o.replacement) || '（空串·删除）'}</span></div>
+    <div class="basis"><b>原依据：</b>${esc(o.basis)}</div>
+    <label>当前正文 v${data.currentVersionId} 目标选区：第 ${data.target.seg} 段 [${data.target.start},${data.target.end})</label>
+    <div class="sel-quote">${esc(data.target.excerpt) || '（空串·插入点）'}</div>
+    <details>
+      <summary class="muted" style="cursor:pointer">查看逐版换算依据</summary>
+      <ul class="renew-path">${pathLines}</ul>
+    </details>
+    ${data.eligible ? '' : `<div class="conflict-reason">${esc(data.blockedReason)}</div>`}
+    <div class="actions">
+      <button class="btn" data-close>关闭</button>
+      ${data.eligible ? '<button class="btn primary" id="renew-confirm">确认续提为新待复核提议</button>' : ''}
+    </div>`);
+  const btn = $('#renew-confirm');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    try {
+      const r = await api('/api/proposals/renew-confirm', { method: 'POST', body: { token: data.token } });
+      closeModal();
+      await reload();
+      toast(`已由原提议 #${id} 生成新待复核提议 #${r.id}`, 'success');
+    } catch (err) {
+      toast(`${err.message}；请重新预览，或在当前正文手工选区提交`, 'error');
+      closeModal();
+      await reload();
+    }
+  });
+}
+
 // ---------- 提议详情 / 复核操作 ----------
 function openProposalModal(id) {
   const p = booth.proposals.find((x) => x.id === id);
@@ -426,12 +499,17 @@ function openProposalModal(id) {
     <div class="quote">${esc(p.original_excerpt)}</div>
     <div><span class="arrow">替换为 →</span><span class="replacement">${esc(p.replacement) || '（空串·删除）'}</span>${same ? ' <span class="muted">（与原文相同）</span>' : ''}</div>
     <div class="basis" style="margin-top:8px"><b>依据：</b>${esc(p.basis)}</div>
+    ${p.renewed_from_id ? `<div class="snapshot-note">续提自原提议 #${p.renewed_from_id}：v${p.renewed_from_base} [${p.renewed_from_start},${p.renewed_from_end}) → 当前 v${p.base_ver} [${p.start_cp},${p.end_cp})</div>` : ''}
     ${p.conflict_reason ? `<div class="conflict-reason">冲突原因：${esc(p.conflict_reason)}</div>` : ''}
     <div class="actions">
       <button class="btn" data-close>关闭</button>
+      ${canRenewProposal(p) ? '<button class="btn primary" id="p-renew">续提预览…</button>' : ''}
       ${actionable && p.status === 'pending' ? '<button class="btn danger" id="p-reject">驳回</button><button class="btn primary" id="p-adopt">采纳</button>' : ''}
       ${actionable && p.status === 'adopted' ? '<button class="btn danger" id="p-reject">驳回（移出暂存区）</button>' : ''}
     </div>`);
+
+  const renewBtn = $('#p-renew');
+  if (renewBtn) renewBtn.addEventListener('click', () => openRenewPreview(id));
 
   const adoptBtn = $('#p-adopt');
   if (adoptBtn) adoptBtn.addEventListener('click', async () => {
@@ -587,7 +665,12 @@ function renderProposals() {
       <div class="quote">${esc(p.original_excerpt)}</div>
       <div><span class="arrow">→</span><span class="replacement">${esc(p.replacement) || '（删除）'}</span></div>
       <div class="basis"><b>依据：</b>${esc(p.basis)}</div>
+      ${p.renewed_from_id ? `<div class="snapshot-note">续提自原提议 #${p.renewed_from_id}，原决议与历史版本仍可追溯。</div>` : ''}
       ${p.conflict_reason ? `<div class="conflict-reason">${esc(p.conflict_reason)}</div>` : ''}
+      ${canRenewProposal(p) ? `
+      <div class="card-actions">
+        <button class="btn small primary" data-renew="${p.id}">续提预览…</button>
+      </div>` : ''}
       ${canReview ? `
       <div class="card-actions">
         ${p.status === 'pending' ? `<button class="btn small primary" data-adopt="${p.id}">采纳</button>` : ''}
@@ -597,6 +680,9 @@ function renderProposals() {
     </div>`;
   }).join('');
 
+  $$('#panel-proposals [data-renew]').forEach((b) => b.addEventListener('click', () => {
+    openRenewPreview(parseInt(b.dataset.renew, 10));
+  }));
   $$('#panel-proposals [data-adopt]').forEach((b) => b.addEventListener('click', async () => {
     const id = parseInt(b.dataset.adopt, 10);
     try {

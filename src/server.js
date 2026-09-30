@@ -67,6 +67,20 @@ app.post('/api/proposals', requireRole('recordist'), wrap((req, res) => {
   res.status(201).json({ ok: true, id });
 }));
 
+app.post('/api/proposals/:id/renew-preview', requireRole('recordist'), wrap((req, res) => {
+  const preview = store.renewProposalPreview(db, req.user, parseInt(req.params.id, 10));
+  res.json({ ok: true, preview });
+}));
+
+app.post('/api/proposals/renew-confirm', requireRole('recordist'), wrap((req, res) => {
+  const token = (req.body || {}).token;
+  if (typeof token !== 'string' || !token) {
+    return res.status(400).json({ error: '缺少续提确认凭证 token，请重新预览', code: 'BAD_RENEW_TOKEN' });
+  }
+  const result = store.confirmRenewProposal(db, req.user, token);
+  res.status(201).json({ ok: true, ...result });
+}));
+
 app.post('/api/proposals/:id/adopt', requireRole('reviewer'), wrap((req, res) => {
   const result = store.adoptProposal(db, req.user, parseInt(req.params.id, 10));
   res.json({ ok: true, ...result });

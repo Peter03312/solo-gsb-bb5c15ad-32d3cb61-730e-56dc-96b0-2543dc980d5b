@@ -1,7 +1,7 @@
 'use strict';
 // 纯文本算子单元测试（码点偏移、合版、引用映射）
 const assert = require('assert');
-const { codeLength, sliceCP, validateRange, applyEdits, transformRange } = require('../src/text');
+const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeStrict } = require('../src/text');
 const { parseTranscript } = require('../src/store');
 
 let n = 0;
@@ -37,6 +37,22 @@ ok(t.affected === true, '引用与修订相交：标记需重新定位');
 // 修订在引用之后 → 坐标不变
 t = transformRange({ start: 0, end: 2 }, [{ start: 3, end: 4, replace: 'QQQQ' }]);
 ok(t.start === 0 && t.end === 2 && t.affected === false, '引用在修订之前：坐标不变');
+
+// 续提严格换算：相邻半开区间不触及非空选区，只平移
+t = transformRangeStrict({ start: 2, end: 4 }, [{ start: 0, end: 2, replace: 'XYZ' }]);
+ok(t.start === 3 && t.end === 5 && t.touched === false, '续提：选区前的相邻修订仅平移坐标');
+
+// 续提严格换算：边界相交即拒绝
+t = transformRangeStrict({ start: 2, end: 4 }, [{ start: 3, end: 5, replace: 'Q' }]);
+ok(t.touched === true && t.touch.start === 3, '续提：修订触及选区内部时拒绝');
+
+// 零长度插入点：任一端点重合的插入/替换都视为触及
+t = transformRangeStrict({ start: 2, end: 2 }, [{ start: 2, end: 2, replace: '新' }]);
+ok(t.touched === true, '续提：零长度插入点被同点插入触及');
+t = transformRangeStrict({ start: 2, end: 2 }, [{ start: 0, end: 2, replace: 'AB' }]);
+ok(t.touched === true, '续提：零长度插入点与前一修订末端相接也拒绝');
+t = transformRangeStrict({ start: 2, end: 2 }, [{ start: 0, end: 1, replace: 'AB' }]);
+ok(t.start === 3 && t.end === 3 && t.touched === false, '续提：零长度插入点只随其前修订平移');
 
 // 解析：段号与自动编号
 const segs = parseTranscript('1. 第一段\n2、第二段\n无段号正文\n4 第四段\n');
